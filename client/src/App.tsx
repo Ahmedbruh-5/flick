@@ -1,18 +1,22 @@
 import { useState } from 'react';
+import { HistoryFlow } from './components/HistoryFlow';
+import { InfoMenu } from './components/InfoMenu';
 import { ReceiveFlow } from './components/ReceiveFlow';
 import { SendFlow } from './components/SendFlow';
 import './App.css';
 
-type Mode = 'home' | 'send' | 'receive';
+type Mode = 'home' | 'send' | 'receive' | 'history';
 
 export default function App() {
   const [mode, setMode] = useState<Mode>('home');
 
   if (mode === 'send') return <SendFlow onBack={() => setMode('home')} />;
   if (mode === 'receive') return <ReceiveFlow onBack={() => setMode('home')} />;
+  if (mode === 'history') return <HistoryFlow onBack={() => setMode('home')} />;
 
   return (
     <div className="shell">
+      <InfoMenu onHistory={() => setMode('history')} />
       <div className="atmosphere" aria-hidden />
       <main className="hero">
         <p className="brand">Flick</p>

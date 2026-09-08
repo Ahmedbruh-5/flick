@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { deriveSessionKey, generateKeyPair, type KeyPair } from '../lib/crypto';
+import { addHistoryEntry } from '../lib/history';
 import { assertTransferSupport, secureContextHint } from '../lib/secure';
 import { SignalingClient } from '../lib/signaling';
 import {
@@ -36,6 +37,7 @@ export function ReceiveFlow({ onBack }: Props) {
   const [connectionType, setConnectionType] = useState<ConnectionType>('unknown');
   const [progress, setProgress] = useState<TransferProgress | null>(null);
   const [receivedFile, setReceivedFile] = useState<File | null>(null);
+  const [sessionNonce, setSessionNonce] = useState(0);
 
   const keyPairRef = useRef<KeyPair | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -44,6 +46,11 @@ export function ReceiveFlow({ onBack }: Props) {
   const sessionKeyRef = useRef<CryptoKey | null>(null);
   const receivingRef = useRef(false);
   const connectionTypeRef = useRef<ConnectionType>('unknown');
+  const historyRecordedRef = useRef(false);
+  const progressRef = useRef<TransferProgress | null>(null);
+  const receivedMetaRef = useRef<{ name: string; size: number } | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const phaseRef = useRef<Phase>('starting');
 
   const cleanup = useCallback(() => {
     peerRef.current?.close();
@@ -52,8 +59,62 @@ export function ReceiveFlow({ onBack }: Props) {
     signalingRef.current = null;
   }, []);
 
+  const recordReceiveHistory = useCallback(
+    (
+      status: 'done' | 'failed',
+      meta?: { name: string; size: number },
+      errorMessage?: string,
+    ) => {
+      if (historyRecordedRef.current) return;
+      const fileMeta =
+        meta ??
+        receivedMetaRef.current ??
+        (progressRef.current?.fileName
+          ? {
+              name: progressRef.current.fileName,
+              size: progressRef.current.totalBytes,
+            }
+          : null);
+      if (!fileMeta) return;
+      historyRecordedRef.current = true;
+      addHistoryEntry({
+        direction: 'received',
+        fileName: fileMeta.name,
+        fileSize: fileMeta.size,
+        status,
+        connectionType: connectionTypeRef.current,
+        error: errorMessage,
+      });
+    },
+    [],
+  );
+
+  const setPhaseTracked = useCallback((next: Phase) => {
+    phaseRef.current = next;
+    setPhase(next);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
+    const abort = new AbortController();
+    abortRef.current = abort;
+
+    historyRecordedRef.current = false;
+    receivingRef.current = false;
+    connectionTypeRef.current = 'unknown';
+    progressRef.current = null;
+    receivedMetaRef.current = null;
+    keyPairRef.current = null;
+    sessionIdRef.current = null;
+    sessionKeyRef.current = null;
+
+    setPhaseTracked('starting');
+    setCode(null);
+    setQrValue(null);
+    setError(null);
+    setConnectionType('unknown');
+    setProgress(null);
+    setReceivedFile(null);
 
     const start = async () => {
       try {
@@ -63,7 +124,7 @@ export function ReceiveFlow({ onBack }: Props) {
 
         const signaling = new SignalingClient({
           onSessionCreated: ({ sessionId, code: shortCode }) => {
-            if (cancelled) return;
+            if (cancelled || abort.signal.aborted) return;
             sessionIdRef.current = sessionId;
             setCode(shortCode);
             const payload: PairingPayload = {
@@ -73,18 +134,26 @@ export function ReceiveFlow({ onBack }: Props) {
               publicKey: keyPair.publicKeyHex,
             };
             setQrValue(JSON.stringify(payload));
-            setPhase('waiting');
+            setPhaseTracked('waiting');
           },
           onPeerJoined: ({ peerPublicKey }) => {
             void (async () => {
-              if (cancelled || !sessionIdRef.current || !keyPairRef.current) return;
+              if (
+                cancelled ||
+                abort.signal.aborted ||
+                !sessionIdRef.current ||
+                !keyPairRef.current
+              ) {
+                return;
+              }
               try {
-                setPhase('connecting');
+                setPhaseTracked('connecting');
                 const sessionKey = await deriveSessionKey(
                   keyPairRef.current.privateKey,
                   peerPublicKey,
                   sessionIdRef.current,
                 );
+                if (abort.signal.aborted) return;
                 sessionKeyRef.current = sessionKey;
 
                 const peer = new FlickPeer({
@@ -96,41 +165,66 @@ export function ReceiveFlow({ onBack }: Props) {
                       setConnectionType(type);
                     },
                     onDataChannel: (channel) => {
-                      if (receivingRef.current || !sessionKeyRef.current) return;
+                      if (
+                        receivingRef.current ||
+                        !sessionKeyRef.current ||
+                        abort.signal.aborted
+                      ) {
+                        return;
+                      }
                       receivingRef.current = true;
-                      setPhase('transferring');
+                      setPhaseTracked('transferring');
                       void receiveFile({
                         channel,
                         sessionKey: sessionKeyRef.current,
                         connectionType: connectionTypeRef.current,
+                        signal: abort.signal,
                         onProgress: (p) => {
-                          setProgress({
+                          const next = {
                             ...p,
                             connectionType: connectionTypeRef.current,
-                          });
+                          };
+                          progressRef.current = next;
+                          setProgress(next);
                         },
                       })
                         .then((file) => {
+                          if (abort.signal.aborted) return;
+                          receivedMetaRef.current = {
+                            name: file.name,
+                            size: file.size,
+                          };
                           setReceivedFile(file);
-                          setPhase('done');
+                          setPhaseTracked('done');
+                          recordReceiveHistory('done', {
+                            name: file.name,
+                            size: file.size,
+                          });
                         })
                         .catch((err: unknown) => {
-                          setError(
-                            err instanceof Error ? err.message : 'Transfer failed',
-                          );
-                          setPhase('failed');
+                          if (abort.signal.aborted) return;
+                          const message =
+                            err instanceof Error
+                              ? err.message
+                              : 'Transfer failed';
+                          setError(message);
+                          setPhaseTracked('failed');
+                          recordReceiveHistory('failed', undefined, message);
                         });
                     },
                     onError: (message) => {
+                      if (abort.signal.aborted) return;
                       setError(message);
-                      setPhase('failed');
+                      setPhaseTracked('failed');
+                      recordReceiveHistory('failed', undefined, message);
                     },
                   },
                 });
                 peerRef.current = peer;
               } catch (err) {
+                if (abort.signal.aborted) return;
                 setError(err instanceof Error ? err.message : 'Failed to connect');
-                setPhase('failed');
+                setPhaseTracked('failed');
               }
             })();
           },
@@ -138,25 +232,29 @@ export function ReceiveFlow({ onBack }: Props) {
             void peerRef.current?.handleSignal(payload);
           },
           onPeerLeft: () => {
-            setPhase((current) => {
-              if (current === 'done') return current;
-              setError('Sender disconnected');
-              return 'failed';
-            });
+            if (abort.signal.aborted) return;
+            if (phaseRef.current === 'done') return;
+            const message = 'Sender disconnected';
+            setError(message);
+            setPhaseTracked('failed');
+            recordReceiveHistory('failed', undefined, message);
           },
           onError: (message) => {
+            if (abort.signal.aborted) return;
             setError(message);
-            setPhase('failed');
+            setPhaseTracked('failed');
+            recordReceiveHistory('failed', undefined, message);
           },
         });
 
         signalingRef.current = signaling;
         await signaling.connect();
+        if (cancelled || abort.signal.aborted) return;
         signaling.createSession('receiver', keyPair.publicKeyHex);
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || abort.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'Failed to start');
-        setPhase('failed');
+        setPhaseTracked('failed');
       }
     };
 
@@ -164,10 +262,36 @@ export function ReceiveFlow({ onBack }: Props) {
 
     return () => {
       cancelled = true;
+      abort.abort();
       cleanup();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cleanup]);
+  }, [cleanup, recordReceiveHistory, sessionNonce, setPhaseTracked]);
+
+  const cancelTransfer = () => {
+    const message = 'Transfer cancelled';
+    abortRef.current?.abort();
+    cleanup();
+    setError(message);
+    setPhaseTracked('failed');
+    setProgress((prev) =>
+      prev
+        ? { ...prev, status: 'failed', error: message, speedBps: 0 }
+        : prev,
+    );
+    recordReceiveHistory('failed', undefined, message);
+  };
+
+  const retryReceive = () => {
+    abortRef.current?.abort();
+    cleanup();
+    setSessionNonce((n) => n + 1);
+  };
+
+  const goHome = () => {
+    abortRef.current?.abort();
+    cleanup();
+    onBack();
+  };
 
   const download = () => {
     if (!receivedFile) return;
@@ -179,9 +303,24 @@ export function ReceiveFlow({ onBack }: Props) {
     URL.revokeObjectURL(url);
   };
 
+  const canCancel =
+    phase === 'waiting' ||
+    phase === 'connecting' ||
+    phase === 'transferring';
+
   return (
     <section className="flow">
-      <button type="button" className="back" onClick={onBack}>
+      <button
+        type="button"
+        className="back"
+        onClick={() => {
+          if (phase === 'transferring' || phase === 'connecting') {
+            cancelTransfer();
+            return;
+          }
+          goHome();
+        }}
+      >
         ← Back
       </button>
 
@@ -218,6 +357,24 @@ export function ReceiveFlow({ onBack }: Props) {
       {(phase === 'transferring' || phase === 'done' || phase === 'failed') &&
         progress && <TransferProgressView progress={progress} />}
 
+      {canCancel && (
+        <div className="done-actions">
+          <button
+            type="button"
+            className="btn ghost full"
+            onClick={() => {
+              if (phase === 'waiting') {
+                goHome();
+                return;
+              }
+              cancelTransfer();
+            }}
+          >
+            {phase === 'waiting' ? 'Cancel' : 'Cancel transfer'}
+          </button>
+        </div>
+      )}
+
       {phase === 'done' && receivedFile && (
         <div className="done-actions">
           <p className="success-text">
@@ -226,15 +383,19 @@ export function ReceiveFlow({ onBack }: Props) {
           <button type="button" className="btn primary full" onClick={download}>
             Download file
           </button>
-          <button
-            type="button"
-            className="btn ghost full"
-            onClick={() => {
-              cleanup();
-              onBack();
-            }}
-          >
+          <button type="button" className="btn ghost full" onClick={goHome}>
             Done
+          </button>
+        </div>
+      )}
+
+      {phase === 'failed' && (
+        <div className="done-actions">
+          <button type="button" className="btn primary full" onClick={retryReceive}>
+            Try again
+          </button>
+          <button type="button" className="btn ghost full" onClick={goHome}>
+            Back home
           </button>
         </div>
       )}

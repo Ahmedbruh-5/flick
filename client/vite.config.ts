@@ -7,9 +7,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), basicSsl()],
   server: {
     host: true,
-    port: 5173,
+    port: 5176,
     // Phone/LAN testing: one HTTPS origin. Proxy signaling so browsers
-    // only need :5173 (wss), not a separate :8787 firewall hole.
+    // only need :5176 (wss), not a separate :8787 firewall hole.
     proxy: {
       '/ws': {
         target: 'ws://127.0.0.1:8787',

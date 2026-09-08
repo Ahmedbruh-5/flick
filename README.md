@@ -12,7 +12,7 @@ cd server && npm run dev
 cd client && npm run dev
 ```
 
-Open the **HTTPS Network** URL Vite prints (e.g. `https://192.168.1.9:5173`) on both devices.
+Open the **HTTPS Network** URL Vite prints (e.g. `https://192.168.1.9:5176`) on both devices.
 
 On a phone you’ll see a certificate warning — tap Advanced → Proceed. Plain `http://` on a LAN IP will hang forever: browsers block WebRTC there.
 
@@ -20,7 +20,7 @@ On a phone you’ll see a certificate warning — tap Advanced → Proceed. Plai
 2. On device B: **Send** → pick a file → enter the code  
 3. Watch speed + connection type (LAN / P2P) while it transfers
 
-Signaling is proxied through Vite (`/ws`), so phones only need port **5173**.
+Signaling is proxied through Vite (`/ws`), so phones only need port **5176**.
 
 ## Stack
 

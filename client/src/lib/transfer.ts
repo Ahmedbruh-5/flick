@@ -28,7 +28,22 @@ const BUFFERED_AMOUNT_HIGH = 1024 * 1024;
 
 export type ProgressCallback = (progress: TransferProgress) => void;
 
-function waitForChannelOpen(channel: RTCDataChannel): Promise<void> {
+export class TransferCancelledError extends Error {
+  constructor(message = 'Transfer cancelled') {
+    super(message);
+    this.name = 'TransferCancelledError';
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new TransferCancelledError();
+}
+
+function waitForChannelOpen(
+  channel: RTCDataChannel,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
   if (channel.readyState === 'open') return Promise.resolve();
   return new Promise((resolve, reject) => {
     const onOpen = () => {
@@ -39,24 +54,58 @@ function waitForChannelOpen(channel: RTCDataChannel): Promise<void> {
       cleanup();
       reject(new Error('Data channel failed'));
     };
+    const onAbort = () => {
+      cleanup();
+      reject(new TransferCancelledError());
+    };
     const cleanup = () => {
       channel.removeEventListener('open', onOpen);
       channel.removeEventListener('error', onError);
+      signal?.removeEventListener('abort', onAbort);
     };
     channel.addEventListener('open', onOpen);
     channel.addEventListener('error', onError);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
-function waitForBufferLow(channel: RTCDataChannel): Promise<void> {
+function waitForBufferLow(
+  channel: RTCDataChannel,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
   if (channel.bufferedAmount < BUFFERED_AMOUNT_LOW) return Promise.resolve();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW;
     const onLow = () => {
-      channel.removeEventListener('bufferedamountlow', onLow);
+      cleanup();
       resolve();
     };
+    const onAbort = () => {
+      cleanup();
+      reject(new TransferCancelledError());
+    };
+    const cleanup = () => {
+      channel.removeEventListener('bufferedamountlow', onLow);
+      signal?.removeEventListener('abort', onAbort);
+    };
     channel.addEventListener('bufferedamountlow', onLow);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new TransferCancelledError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -92,7 +141,7 @@ export async function sendFile(opts: {
     throw new Error('File exceeds the 2 GB MVP limit');
   }
 
-  await waitForChannelOpen(channel);
+  await waitForChannelOpen(channel, signal);
 
   const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
   const meta: FileMeta = {
@@ -143,7 +192,7 @@ export async function sendFile(opts: {
     const inFlight = new Set<number>();
 
     while (acked.size < totalChunks) {
-      if (signal?.aborted) throw new Error('Transfer cancelled');
+      throwIfAborted(signal);
       if (remoteError) throw new Error(remoteError);
       if (channel.readyState !== 'open') throw new Error('Connection lost');
 
@@ -175,7 +224,7 @@ export async function sendFile(opts: {
       }
 
       if (channel.bufferedAmount >= BUFFERED_AMOUNT_HIGH) {
-        await waitForBufferLow(channel);
+        await waitForBufferLow(channel, signal);
       }
 
       // Drop in-flight that got acked
@@ -198,10 +247,10 @@ export async function sendFile(opts: {
       });
 
       if (acked.size < totalChunks && inFlight.size >= ACK_BATCH) {
-        await new Promise((r) => setTimeout(r, 16));
+        await delay(16, signal);
       } else if (acked.size < totalChunks && nextToSend >= totalChunks) {
         // Waiting on final acks
-        await new Promise((r) => setTimeout(r, 16));
+        await delay(16, signal);
       }
     }
 
@@ -240,7 +289,7 @@ export async function receiveFile(opts: {
   signal?: AbortSignal;
 }): Promise<File> {
   const { channel, sessionKey, onProgress, signal } = opts;
-  await waitForChannelOpen(channel);
+  await waitForChannelOpen(channel, signal);
 
   const speed = new SpeedTracker();
   let meta: FileMeta | null = null;
@@ -262,11 +311,16 @@ export async function receiveFile(opts: {
   };
 
   return new Promise<File>((resolve, reject) => {
+    let interval = 0;
+
     const cleanup = () => {
       channel.removeEventListener('message', onMessage);
+      signal?.removeEventListener('abort', onAbort);
+      window.clearInterval(interval);
     };
 
     const fail = (message: string) => {
+      if (failed || finished) return;
       failed = message;
       cleanup();
       try {
@@ -283,7 +337,15 @@ export async function receiveFile(opts: {
         error: message,
         fileName: meta?.name,
       });
-      reject(new Error(message));
+      reject(
+        message === 'Transfer cancelled'
+          ? new TransferCancelledError(message)
+          : new Error(message),
+      );
+    };
+
+    const onAbort = () => {
+      fail('Transfer cancelled');
     };
 
     const onMessage = (event: MessageEvent) => {
@@ -423,18 +485,29 @@ export async function receiveFile(opts: {
     };
 
     channel.addEventListener('message', onMessage);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      fail('Transfer cancelled');
+      return;
+    }
 
-    const interval = window.setInterval(() => {
+    interval = window.setInterval(() => {
       if (finished || failed) {
         window.clearInterval(interval);
         return;
       }
       if (channel.readyState !== 'open') {
-        window.clearInterval(interval);
         fail('Connection lost');
       }
     }, 500);
   });
+}
+
+export function isTransferCancelled(err: unknown): boolean {
+  return (
+    err instanceof TransferCancelledError ||
+    (err instanceof Error && err.message === 'Transfer cancelled')
+  );
 }
 
 export function formatBytes(bytes: number): string {

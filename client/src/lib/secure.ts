@@ -2,7 +2,7 @@
 export function assertTransferSupport(): void {
   if (!window.isSecureContext) {
     throw new Error(
-      'This page is not secure. On your phone open the HTTPS URL from your Mac (https://192.168.x.x:5173), then accept the certificate warning.',
+      'This page is not secure. On your phone open the HTTPS URL from your Mac (https://192.168.x.x:5176), then accept the certificate warning.',
     );
   }
 

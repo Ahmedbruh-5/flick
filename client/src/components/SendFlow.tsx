@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import { deriveSessionKey, generateKeyPair, type KeyPair } from '../lib/crypto';
+import { addHistoryEntry } from '../lib/history';
 import { assertTransferSupport, secureContextHint } from '../lib/secure';
 import { SignalingClient } from '../lib/signaling';
 import { formatBytes, sendFile } from '../lib/transfer';
@@ -59,6 +60,8 @@ export function SendFlow({ onBack }: Props) {
   const connectionTypeRef = useRef<ConnectionType>('unknown');
   const sendingRef = useRef(false);
   const fileRef = useRef<File | null>(null);
+  const historyRecordedRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const cleanup = useCallback(() => {
     peerRef.current?.close();
@@ -66,6 +69,53 @@ export function SendFlow({ onBack }: Props) {
     signalingRef.current?.close();
     signalingRef.current = null;
   }, []);
+
+  const recordSendHistory = useCallback(
+    (status: 'done' | 'failed', errorMessage?: string) => {
+      if (historyRecordedRef.current) return;
+      const selected = fileRef.current;
+      if (!selected) return;
+      historyRecordedRef.current = true;
+      addHistoryEntry({
+        direction: 'sent',
+        fileName: selected.name,
+        fileSize: selected.size,
+        status,
+        connectionType: connectionTypeRef.current,
+        error: errorMessage,
+      });
+    },
+    [],
+  );
+
+  const cancelTransfer = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    cleanup();
+    const message = 'Transfer cancelled';
+    setError(message);
+    setPhase('failed');
+    setProgress((prev) =>
+      prev
+        ? { ...prev, status: 'failed', error: message, speedBps: 0 }
+        : prev,
+    );
+    recordSendHistory('failed', message);
+  }, [cleanup, recordSendHistory]);
+
+  const retrySend = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    cleanup();
+    sendingRef.current = false;
+    historyRecordedRef.current = false;
+    connectionTypeRef.current = 'unknown';
+    setError(null);
+    setProgress(null);
+    setShowScanner(false);
+    setCameraError(null);
+    setPhase('pair');
+  }, [cleanup]);
 
   const onFile = (selected: File | null) => {
     setError(null);
@@ -90,8 +140,15 @@ export function SendFlow({ onBack }: Props) {
     if (!selected) return;
     setError(null);
     setShowScanner(false);
+    setProgress(null);
     setPhase('connecting');
     sendingRef.current = false;
+    historyRecordedRef.current = false;
+    connectionTypeRef.current = 'unknown';
+
+    abortRef.current?.abort();
+    const abort = new AbortController();
+    abortRef.current = abort;
 
     try {
       assertTransferSupport();
@@ -103,28 +160,41 @@ export function SendFlow({ onBack }: Props) {
       let peerPublicKey = opts.peerPublicKeyFromQr ?? null;
 
       const fail = (message: string) => {
+        if (abort.signal.aborted) return;
         setError(message);
         setPhase('failed');
+        recordSendHistory('failed', message);
       };
 
       const signaling = new SignalingClient({
         onSessionJoined: (data) => {
+          if (abort.signal.aborted) return;
           sessionId = data.sessionId;
           peerPublicKey = opts.peerPublicKeyFromQr ?? data.peerPublicKey;
-          void setupPeer(signaling, keyPair, sessionId, peerPublicKey, selected).catch(
-            (err: unknown) => {
-              fail(err instanceof Error ? err.message : 'Failed to set up peer');
-            },
-          );
+          void setupPeer(
+            signaling,
+            keyPair,
+            sessionId,
+            peerPublicKey,
+            selected,
+            abort.signal,
+          ).catch((err: unknown) => {
+            fail(err instanceof Error ? err.message : 'Failed to set up peer');
+          });
         },
         onPeerJoined: (data) => {
-          if (!sessionId) return;
+          if (abort.signal.aborted || !sessionId) return;
           peerPublicKey = data.peerPublicKey;
-          void setupPeer(signaling, keyPair, sessionId, peerPublicKey, selected).catch(
-            (err: unknown) => {
-              fail(err instanceof Error ? err.message : 'Failed to set up peer');
-            },
-          );
+          void setupPeer(
+            signaling,
+            keyPair,
+            sessionId,
+            peerPublicKey,
+            selected,
+            abort.signal,
+          ).catch((err: unknown) => {
+            fail(err instanceof Error ? err.message : 'Failed to set up peer');
+          });
         },
         onSignal: (payload) => {
           void peerRef.current?.handleSignal(payload);
@@ -139,6 +209,7 @@ export function SendFlow({ onBack }: Props) {
 
       signalingRef.current = signaling;
       await signaling.connect();
+      if (abort.signal.aborted) return;
 
       if (opts.sessionId) {
         signaling.joinBySessionId(opts.sessionId, 'sender', keyPair.publicKeyHex);
@@ -148,8 +219,11 @@ export function SendFlow({ onBack }: Props) {
         throw new Error('Missing pairing info');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect');
+      if (abort.signal.aborted) return;
+      const message = err instanceof Error ? err.message : 'Failed to connect';
+      setError(message);
       setPhase('failed');
+      recordSendHistory('failed', message);
     }
   };
 
@@ -159,14 +233,16 @@ export function SendFlow({ onBack }: Props) {
     sessionId: string,
     peerPublicKey: string,
     selectedFile: File,
+    signal: AbortSignal,
   ) => {
-    if (peerRef.current) return;
+    if (peerRef.current || signal.aborted) return;
 
     const sessionKey = await deriveSessionKey(
       keyPair.privateKey,
       peerPublicKey,
       sessionId,
     );
+    if (signal.aborted) return;
 
     const peer = new FlickPeer({
       isReceiver: false,
@@ -179,7 +255,7 @@ export function SendFlow({ onBack }: Props) {
           );
         },
         onDataChannel: (channel) => {
-          if (sendingRef.current) return;
+          if (sendingRef.current || signal.aborted) return;
           sendingRef.current = true;
           setPhase('transferring');
           void sendFile({
@@ -187,19 +263,30 @@ export function SendFlow({ onBack }: Props) {
             channel,
             sessionKey,
             connectionType: connectionTypeRef.current,
+            signal,
             onProgress: (p) => {
               setProgress({ ...p, connectionType: connectionTypeRef.current });
             },
           })
-            .then(() => setPhase('done'))
+            .then(() => {
+              if (signal.aborted) return;
+              setPhase('done');
+              recordSendHistory('done');
+            })
             .catch((err: unknown) => {
-              setError(err instanceof Error ? err.message : 'Transfer failed');
+              if (signal.aborted) return;
+              const message =
+                err instanceof Error ? err.message : 'Transfer failed';
+              setError(message);
               setPhase('failed');
+              recordSendHistory('failed', message);
             });
         },
         onError: (message) => {
+          if (signal.aborted) return;
           setError(message);
           setPhase('failed');
+          recordSendHistory('failed', message);
         },
       },
     });
@@ -232,14 +319,26 @@ export function SendFlow({ onBack }: Props) {
     void beginTransfer({ code });
   };
 
+  const goHome = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    cleanup();
+    onBack();
+  };
+
+  const canCancel = phase === 'connecting' || phase === 'transferring';
+
   return (
     <section className="flow">
       <button
         type="button"
         className="back"
         onClick={() => {
-          cleanup();
-          onBack();
+          if (canCancel) {
+            cancelTransfer();
+            return;
+          }
+          goHome();
         }}
       >
         ← Back
@@ -343,18 +442,32 @@ export function SendFlow({ onBack }: Props) {
             <p className="muted">Negotiating secure channel…</p>
           )}
           {progress && <TransferProgressView progress={progress} />}
+          {canCancel && (
+            <div className="done-actions">
+              <button
+                type="button"
+                className="btn ghost full"
+                onClick={cancelTransfer}
+              >
+                Cancel transfer
+              </button>
+            </div>
+          )}
           {phase === 'done' && (
             <div className="done-actions">
               <p className="success-text">Sent successfully.</p>
-              <button
-                type="button"
-                className="btn primary full"
-                onClick={() => {
-                  cleanup();
-                  onBack();
-                }}
-              >
+              <button type="button" className="btn primary full" onClick={goHome}>
                 Done
+              </button>
+            </div>
+          )}
+          {phase === 'failed' && (
+            <div className="done-actions">
+              <button type="button" className="btn primary full" onClick={retrySend}>
+                Try again
+              </button>
+              <button type="button" className="btn ghost full" onClick={goHome}>
+                Back home
               </button>
             </div>
           )}

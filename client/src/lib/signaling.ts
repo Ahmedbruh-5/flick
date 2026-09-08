@@ -25,7 +25,7 @@ function defaultWsUrl(): string {
   if (override) return override;
 
   // Same origin as the page (Vite proxies /ws → signaling server).
-  // Works for https://192.168.x.x:5173 on phones without opening port 8787.
+  // Works for https://192.168.x.x:5176 on phones without opening port 8787.
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
   return `${proto}://${window.location.host}/ws`;
 }
